@@ -11,12 +11,20 @@ import java.time.Duration;
 
 public class AIExplanationService {
 
-    private static final String API_KEY = "AIzaSyBXX6OvX52l3Q1FGsMP6S94tuh7fAKyKuw";
-    private static final String API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=" + API_KEY;
     private final HttpClient httpClient;
+    private final String apiUrl;
 
     public AIExplanationService() {
-        // Build an HTTP client with a 10-second timeout window so a hanging API doesn't freeze the session
+        // Pull the key from the system environment securely
+        String apiKey = System.getenv("GEMINI_API_KEY");
+
+        if (apiKey == null || apiKey.trim().isEmpty()) {
+            System.err.println("WARNING: GEMINI_API_KEY environment variable is missing.");
+            this.apiUrl = ""; // Will trigger the fallback mechanism cleanly
+        } else {
+            this.apiUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=" + apiKey;
+        }
+
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
                 .build();
@@ -37,7 +45,7 @@ public class AIExplanationService {
             String requestBody = String.format("{\"contents\":[{\"parts\":[{\"text\":\"%s\"}]}]}", escapeJson(prompt));
 
             HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(API_URL))
+                    .uri(URI.create(this.apiUrl))
                     .header("Content-Type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(requestBody))
                     .build();
