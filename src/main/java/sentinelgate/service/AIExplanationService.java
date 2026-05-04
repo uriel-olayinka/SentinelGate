@@ -1,6 +1,8 @@
 package sentinelgate.service;
 
+import sentinelgate.model.Account;
 import sentinelgate.model.FraudFlag;
+import sentinelgate.model.Transaction;
 
 import java.io.IOException;
 import java.net.URI;
@@ -8,21 +10,20 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
 
 public class AIExplanationService {
 
     private final HttpClient httpClient;
-    private final String apiUrl;
+    private final String apiKey;
 
     public AIExplanationService() {
-        // Pull the key from the system environment securely
-        String apiKey = System.getenv("GEMINI_API_KEY");
+        this.apiKey = System.getenv("OPENROUTER_API_KEY");
 
         if (apiKey == null || apiKey.trim().isEmpty()) {
-            System.err.println("WARNING: GEMINI_API_KEY environment variable is missing.");
-            this.apiUrl = ""; // Will trigger the fallback mechanism cleanly
-        } else {
-            this.apiUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=" + apiKey;
+            System.err.println("WARNING: OPENROUTER_API_KEY environment variable is missing. Fallback mode active.");
         }
 
         this.httpClient = HttpClient.newBuilder()
@@ -30,93 +31,179 @@ public class AIExplanationService {
                 .build();
     }
 
-    /*
-    Takes a FraudFlag and returns a human-readable explanation
+    // ------------------------------------------------------------------
+    // Single-shot explanation (used for the initial flag summary)
+    // ------------------------------------------------------------------
+
+    public String getExplanation(FraudFlag flag, Account account) {
+        if (flag == null) return "No suspicious activity detected.";
+
+        String prompt = buildInitialPrompt(flag, account);
+        return callOpenRouter(List.of(Map.of("role", "user", "text", prompt)));
+    }
+
+    // ------------------------------------------------------------------
+    // Multi-turn conversational follow-up
+    // ------------------------------------------------------------------
+
+    /**
+     * Holds the conversation history for a single flag review session.
+     * Each entry is a map with "role" (user/model) and "text".
      */
-    public String getExplanation(FraudFlag flag) {
-        if (flag == null) {
-            return "No suspicious activity detected.";
+    public static class ConversationSession {
+        private final List<Map<String, String>> history = new ArrayList<>();
+
+        public void addTurn(String role, String text) {
+            history.add(Map.of("role", role, "text", text));
         }
 
-        try {
-            String prompt = buildPrompt(flag);
+        public List<Map<String, String>> getHistory() {
+            return history;
+        }
+    }
 
-            // Constructing a lightweight, standard JSON payload string
-            String requestBody = String.format("{\"contents\":[{\"parts\":[{\"text\":\"%s\"}]}]}", escapeJson(prompt));
+    /**
+     * Sends a follow-up user message within an existing session and returns the AI reply.
+     * The full conversation history is included so the AI has context.
+     */
+    public String chat(ConversationSession session, String userMessage) {
+        session.addTurn("user", userMessage);
+        String reply = callOpenRouter(session.getHistory());
+        session.addTurn("model", reply);
+        return reply;
+    }
+
+    /**
+     * Creates a fresh ConversationSession seeded with the initial flag explanation.
+     * This is the entry point for starting an interactive review.
+     */
+    public ConversationSession startSession(FraudFlag flag, Account account) {
+        ConversationSession session = new ConversationSession();
+        String systemPrompt = buildInitialPrompt(flag, account);
+        session.addTurn("user", systemPrompt);
+        String firstReply = callOpenRouter(session.getHistory());
+        session.addTurn("model", firstReply);
+        return session;
+    }
+
+    // ------------------------------------------------------------------
+    // Prompt builders
+    // ------------------------------------------------------------------
+
+    private String buildInitialPrompt(FraudFlag flag, Account account) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("You are SentinelGate, a fraud analysis assistant for banking analysts. ");
+        sb.append("A transaction has been flagged. Explain the risk clearly and professionally in 2-3 sentences. ");
+        sb.append("Then wait for follow-up questions.\n\n");
+
+        sb.append("FLAG: ").append(flag.getRuleName()).append(" (").append(flag.getSeverity()).append(" severity)\n");
+        sb.append("DETAILS: ").append(flag.getRawContext()).append("\n\n");
+
+        if (account != null) {
+            List<Transaction> history = account.getTransactionHistory();
+            sb.append("ACCOUNT CONTEXT (").append(account.getAccountId()).append("):\n");
+            sb.append("  Total transactions on record: ").append(history.size()).append("\n");
+            sb.append("  Average transaction amount: $").append(String.format("%.2f", account.getAverageTransactionAmount())).append("\n");
+
+            // Show last 5 transactions for context
+            int start = Math.max(0, history.size() - 5);
+            sb.append("  Last ").append(history.size() - start).append(" transactions:\n");
+            for (int i = start; i < history.size(); i++) {
+                Transaction t = history.get(i);
+                sb.append("    - ").append(t.getTransactionDetails())
+                        .append(" at ").append(t.getTimestamp()).append("\n");
+            }
+        }
+
+        return sb.toString();
+    }
+
+    // ------------------------------------------------------------------
+    // HTTP layer — OpenRouter (OpenAI-compatible API)
+    // ------------------------------------------------------------------
+
+    private String callOpenRouter(List<Map<String, String>> turns) {
+        try {
+            String url = "https://openrouter.ai/api/v1/chat/completions";
+            String requestBody = buildRequestBody(turns);
 
             HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(this.apiUrl))
+                    .uri(URI.create(url))
                     .header("Content-Type", "application/json")
+                    .header("Authorization", "Bearer " + apiKey)
                     .POST(HttpRequest.BodyPublishers.ofString(requestBody))
                     .build();
 
             HttpResponse<String> response = sendHttpRequest(request);
 
             if (response.statusCode() == 200 && response.body() != null) {
-                String rawAiText = extractTextFromJson(response.body());
-                return sanitizeAndValidate(rawAiText, flag);
+                String text = extractTextFromJson(response.body());
+                return sanitize(text);
             } else {
-                System.err.println("API Warning: Received HTTP " + response.statusCode());
-                return getFallbackExplanation(flag);
+                System.err.println("API Warning: HTTP " + response.statusCode());
+                return getFallbackExplanation();
             }
         } catch (Exception e) {
-            // Catches timeouts, network drops, and parse errors cleanly
-            System.err.println("AI Service Failure: " + e.getMessage() + ". Falling back to template.");
-            return getFallbackExplanation(flag);
+            System.err.println("AI Service Failure: " + e.getMessage());
+            return getFallbackExplanation();
         }
     }
 
-    private String buildPrompt(FraudFlag flag) {
-        return "You are a helpful banking assistant. Explain the following flagged transaction to a user in one short, clear, and professional sentence. " +
-                "Rule: " + flag.getRuleName() + ". " +
-                "Details: " + flag.getRawContext();
-    }
-
-    // The fallback mechanism ensures that the system never stalls or crashes
-    private String getFallbackExplanation(FraudFlag flag) {
-        return "Transaction flagged by system rule [" + flag.getRuleName() + "]: " + flag.getRawContext();
-    }
-
-    private String sanitizeAndValidate(String aiOutput, FraudFlag flag) {
-        if (aiOutput == null || aiOutput.trim().isEmpty()) {
-            return getFallbackExplanation(flag);
+     // Builds an OpenAI-compatible "messages" JSON payload
+    private String buildRequestBody(List<Map<String, String>> turns) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"model\":\"meta-llama/llama-3.1-8b-instruct\",\"messages\":[");
+        for (int i = 0; i < turns.size(); i++) {
+            Map<String, String> turn = turns.get(i);
+            String role = turn.get("role").equals("model") ? "assistant" : turn.get("role");
+            String text = escapeJson(turn.get("text"));
+            sb.append("{\"role\":\"").append(role).append("\",")
+                    .append("\"content\":\"").append(text).append("\"}");
+            if (i < turns.size() - 1) sb.append(",");
         }
-
-        // Remove rogue newlines and ensure the explanation isn't a giant paragraph
-        String clean = aiOutput.replace("\n", " ").trim();
-        if (clean.length() > 250) {
-            clean = clean.substring(0, 247) + "...";
-        }
-        return clean;
+        sb.append("]}");
+        return sb.toString();
     }
 
-    // A lightweight JSON parser to grab the "text" value without external libraries
-    private String extractTextFromJson(String jsonResponse) {
+    private String getFallbackExplanation() {
+        return "[AI unavailable] Please review the raw context above manually.";
+    }
+
+    private String sanitize(String text) {
+        if (text == null || text.isBlank()) return getFallbackExplanation();
+        return text.replace("\n", " ").trim();
+    }
+
+    // OpenRouter response format: {"choices":[{"message":{"content":"..."}}]}
+    private String extractTextFromJson(String json) {
         try {
-            int textKeyIndex = jsonResponse.indexOf("\"text\":");
-            if (textKeyIndex == -1) return "";
-
-            int startQuote = jsonResponse.indexOf("\"", textKeyIndex + 7);
-            int endQuote = jsonResponse.indexOf("\"", startQuote + 1);
-
-            // Handle escaped quotes inside the AI's response safely
-            while (jsonResponse.charAt(endQuote - 1) == '\\') {
-                endQuote = jsonResponse.indexOf("\"", endQuote + 1);
+            int idx = json.indexOf("\"content\":");
+            if (idx == -1) return "";
+            int start = json.indexOf("\"", idx + 10) + 1;
+            int end = start;
+            while (end < json.length()) {
+                end = json.indexOf("\"", end);
+                if (json.charAt(end - 1) != '\\') break;
+                end++;
             }
-
-            String text = jsonResponse.substring(startQuote + 1, endQuote);
-            // Clean up standard JSON escape characters
-            return text.replace("\\n", " ").replace("\\\"", "\"");
+            return json.substring(start, end)
+                    .replace("\\n", "\n")
+                    .replace("\\\"", "\"")
+                    .replace("\\\\", "\\");
         } catch (Exception e) {
-            return ""; // Triggers the fallback up the chain
+            return "";
         }
     }
 
     private String escapeJson(String text) {
-        return text.replace("\"", "\\\"");
+        if (text == null) return "";
+        return text.replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "");
     }
 
-    // Making this "protected" so Mockito can intercept it during tests
+    // Protected so tests can subclass and intercept
     protected HttpResponse<String> sendHttpRequest(HttpRequest request) throws IOException, InterruptedException {
         return httpClient.send(request, HttpResponse.BodyHandlers.ofString());
     }

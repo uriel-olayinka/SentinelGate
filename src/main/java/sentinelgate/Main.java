@@ -1,8 +1,6 @@
 package sentinelgate;
 
-import sentinelgate.engine.FraudEngine;
-import sentinelgate.engine.ReportGenerator;
-import sentinelgate.engine.ReviewManager;
+import sentinelgate.engine.*;
 import sentinelgate.loader.TransactionLoader;
 import sentinelgate.model.Account;
 import sentinelgate.model.FraudFlag;
@@ -10,78 +8,166 @@ import sentinelgate.model.Transaction;
 import sentinelgate.rule.*;
 import sentinelgate.service.AIExplanationService;
 
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Scanner;
+import java.util.*;
 
 public class Main {
+
+    private static final String AUDIT_LOG_PATH = "sentinelgate_audit.jsonl";
+    private static final String DIVIDER = "========================================";
+
     public static void main(String[] args) {
-        System.out.println("Starting SentinelGate...");
 
-        // 1. Initialize Services
-        TransactionLoader loader = new TransactionLoader();
-        FraudEngine engine = new FraudEngine();
+        // --- Replay / stats mode ---
+        // Run with: java sentinelgate.Main --stats
+        if (args.length > 0 && args[0].equalsIgnoreCase("--stats")) {
+            new AuditReplayer(AUDIT_LOG_PATH).printStats();
+            return;
+        }
+
+        System.out.println(DIVIDER);
+        System.out.println("         SENTINELGATE  v2.0               ");
+        System.out.println(DIVIDER);
+
+        // 1. Initialize services
+        TransactionLoader loader      = new TransactionLoader();
+        FraudEngine       engine      = new FraudEngine();
         AIExplanationService aiService = new AIExplanationService();
-        ReviewManager reviewManager = new ReviewManager();
-        ReportGenerator reportGenerator = new ReportGenerator();
+        ReviewManager     reviewManager = new ReviewManager();
+        ReportGenerator   reportGenerator = new ReportGenerator();
+        RiskScorer        scorer        = new RiskScorer();
+        AuditLogger       auditLogger   = new AuditLogger(AUDIT_LOG_PATH);
 
-        // 2. Register Rules
+        // 2. Register rules
         engine.addRule(new LargeAmountRule());
         engine.addRule(new HighFrequencyRule());
         engine.addRule(new LocationMismatchRule());
         engine.addRule(new AddressMismatchRule());
         engine.addRule(new DeclinePatternRule());
 
-        // 3. Load Data
+        // 3. Load transactions
         List<Transaction> sessionTransactions = loader.loadTransactionsFromCsv("transactions.csv");
-        System.out.println("Loaded " + sessionTransactions.size() + " transactions.");
+        System.out.println("Loaded " + sessionTransactions.size() + " transactions.\n");
 
-        // Need to build Account objects on the fly to hold history
+        // 4. Process transactions — build accounts, evaluate rules, collect flags with context
         Map<String, Account> accounts = new HashMap<>();
 
-        // 4. Process Transactions
+        // Maps each FraudFlag to: [0] its Account, [1] all flags from the same transaction
+        Map<FraudFlag, Account>          flagAccount     = new LinkedHashMap<>();
+        Map<FraudFlag, List<FraudFlag>>  flagSiblings    = new LinkedHashMap<>();
+
         for (Transaction tx : sessionTransactions) {
-            // Get or create the account history
             accounts.putIfAbsent(tx.getAccountId(), new Account(tx.getAccountId()));
             Account currentAccount = accounts.get(tx.getAccountId());
 
-            // Evaluate the transaction against all rules
             List<FraudFlag> flags = engine.evaluateTransaction(tx, currentAccount);
 
-            // Add the current transaction to history after evaluation so it doesn't flag against itself
+            // Add to history AFTER evaluation so a tx doesn't flag against itself
             currentAccount.addTransaction(tx);
 
-            // Register any flags with the ReviewManager
             for (FraudFlag flag : flags) {
                 reviewManager.addFlag(flag);
+                flagAccount.put(flag, currentAccount);
+                flagSiblings.put(flag, flags);  // full sibling list for co-occurrence scoring
             }
         }
 
-        // 5. User Interaction Loop (CLI)
+        // 5. Rank flags by risk score (highest first)
+        List<Map.Entry<FraudFlag, Integer>> rankedFlags = scorer.rankFlags(flagSiblings);
+
+        int total = rankedFlags.size();
+        if (total == 0) {
+            System.out.println("No suspicious transactions detected this session.");
+            reportGenerator.printSessionSummary(reviewManager);
+            return;
+        }
+
+        System.out.println("Detected " + total + " suspicious flag(s). Beginning review (highest risk first).\n");
+
+        // 6. Interactive review loop
         Scanner scanner = new Scanner(System.in);
-        System.out.println("\n--- Interactive Flag Review ---");
 
-        for (FraudFlag flag : reviewManager.getAllFlags().keySet()) {
-            System.out.println("\nALERT: " + flag.getRuleName() + " (" + flag.getSeverity() + " Severity)");
-            System.out.println("Context: " + flag.getRawContext());
+        for (int i = 0; i < rankedFlags.size(); i++) {
+            FraudFlag flag    = rankedFlags.get(i).getKey();
+            int       score   = rankedFlags.get(i).getValue();
+            Account   account = flagAccount.get(flag);
 
-            System.out.println("\nAsking AI for human-readable explanation...");
-            String explanation = aiService.getExplanation(flag);
-            System.out.println("AI Explanation: " + explanation);
+            printFlagHeader(flag, score, i + 1, total, account, accounts);
 
-            System.out.print("\nAction ( [R]eviewed / [D]ismissed / [S]kip ): ");
-            String input = scanner.nextLine().trim().toUpperCase();
+            AIExplanationService.ConversationSession session = null;
 
-            if (input.equals("R")) {
-                reviewManager.markDisposition(flag, ReviewManager.Disposition.REVIEWED);
-            } else if (input.equals("D")) {
-                reviewManager.markDisposition(flag, ReviewManager.Disposition.DISMISSED);
+            // Follow-up chat loop — analyst can ask questions before deciding
+            String analystNotes = "";
+            boolean decided = false;
+
+            while (!decided) {
+                System.out.println("\nOptions: [R]eviewed  [D]ismissed  [S]kip  or type a question to consult the AI");
+                System.out.print("> ");
+                String input = scanner.nextLine().trim();
+
+                if (input.equalsIgnoreCase("R") || input.equalsIgnoreCase("D") || input.equalsIgnoreCase("S")) {
+                    decided = true;
+                    if (input.equalsIgnoreCase("R")) {
+                        reviewManager.markDisposition(flag, ReviewManager.Disposition.REVIEWED);
+                        System.out.print("Optional note (press Enter to skip): ");
+                        analystNotes = scanner.nextLine().trim();
+                        auditLogger.log(flag, ReviewManager.Disposition.REVIEWED, analystNotes, score);
+                        System.out.println("✔ Marked REVIEWED.");
+                    } else if (input.equalsIgnoreCase("D")) {
+                        reviewManager.markDisposition(flag, ReviewManager.Disposition.DISMISSED);
+                        System.out.print("Reason for dismissal (press Enter to skip): ");
+                        analystNotes = scanner.nextLine().trim();
+                        auditLogger.log(flag, ReviewManager.Disposition.DISMISSED, analystNotes, score);
+                        System.out.println("✔ Marked DISMISSED.");
+                    } else {
+                        auditLogger.log(flag, ReviewManager.Disposition.PENDING, "", score);
+                        System.out.println("— Skipped (left as PENDING).");
+                    }
+                } else if (!input.isEmpty()) {
+                    if (session == null) {
+                        System.out.println("Starting AI session...");
+                        session = aiService.startSession(flag, account);
+                        System.out.println("\nAI: " + session.getHistory().get(1).get("text"));
+                    } else {
+                        String reply = aiService.chat(session, input);
+                        System.out.println("\nAI: " + reply);
+                    }
+                }
             }
+
+            System.out.println();
         }
 
-        // 6. Generate Final Report
+        // 7. Flush audit log, then print session summary
+        auditLogger.flush();
         reportGenerator.printSessionSummary(reviewManager);
+
+        System.out.println("Tip: Run with --stats to review historical audit data and dismissed flags.");
         scanner.close();
+    }
+
+    // ------------------------------------------------------------------
+    // Display helpers
+    // ------------------------------------------------------------------
+
+    private static void printFlagHeader(FraudFlag flag, int score, int position, int total,
+                                        Account account, Map<String, Account> allAccounts) {
+        System.out.println("\n" + DIVIDER);
+        System.out.printf("  FLAG %d of %d  |  Risk Score: %d/%d  |  Severity: %s%n",
+                position, total, score, RiskScorer.MAX_SCORE, flag.getSeverity());
+        System.out.println(DIVIDER);
+        System.out.println("Rule:    " + flag.getRuleName());
+        System.out.println("Context: " + flag.getRawContext());
+
+        // Cross-account context panel
+        if (account != null) {
+            List<Transaction> history = account.getTransactionHistory();
+            long flagCount = allAccounts.values().stream()
+                    .filter(a -> a.getAccountId().equals(account.getAccountId()))
+                    .count(); // always 1, but keeps the structure clear
+
+            System.out.println("\n--- Account: " + account.getAccountId() + " ---");
+            System.out.println("  Transactions on record : " + history.size());
+            System.out.printf("  Average tx amount      : $%.2f%n", account.getAverageTransactionAmount());
+        }
     }
 }
