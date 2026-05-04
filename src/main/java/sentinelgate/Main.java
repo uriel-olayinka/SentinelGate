@@ -25,7 +25,7 @@ public class Main {
         }
 
         System.out.println(DIVIDER);
-        System.out.println("         SENTINELGATE  v2.0               ");
+        System.out.println("         SENTINELGATE               ");
         System.out.println(DIVIDER);
 
         // 1. Initialize services
@@ -120,7 +120,7 @@ public class Main {
                         analystNotes = scanner.nextLine().trim();
                         auditLogger.log(flag, ReviewManager.Disposition.DISMISSED, analystNotes, score);
                         System.out.println("✔ Marked DISMISSED.");
-                    } else {
+                    } else if (input.equalsIgnoreCase("S")) {
                         auditLogger.log(flag, ReviewManager.Disposition.PENDING, "", score);
                         System.out.println("— Skipped (left as PENDING).");
                     }
