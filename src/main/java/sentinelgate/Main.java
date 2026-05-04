@@ -93,7 +93,9 @@ public class Main {
 
             printFlagHeader(flag, score, i + 1, total, account, accounts);
 
-            AIExplanationService.ConversationSession session = null;
+            System.out.println("Consulting AI...");
+            AIExplanationService.ConversationSession session = aiService.startSession(flag, account);
+            System.out.println("\nAI: " + session.getHistory().get(1).get("text"));
 
             // Follow-up chat loop — analyst can ask questions before deciding
             String analystNotes = "";
@@ -123,14 +125,9 @@ public class Main {
                         System.out.println("— Skipped (left as PENDING).");
                     }
                 } else if (!input.isEmpty()) {
-                    if (session == null) {
-                        System.out.println("Starting AI session...");
-                        session = aiService.startSession(flag, account);
-                        System.out.println("\nAI: " + session.getHistory().get(1).get("text"));
-                    } else {
-                        String reply = aiService.chat(session, input);
-                        System.out.println("\nAI: " + reply);
-                    }
+                    // Treat anything else as a chat message to the AI
+                    String reply = aiService.chat(session, input);
+                    System.out.println("\nAI: " + reply);
                 }
             }
 
@@ -151,9 +148,19 @@ public class Main {
 
     private static void printFlagHeader(FraudFlag flag, int score, int position, int total,
                                         Account account, Map<String, Account> allAccounts) {
+        // Calculate a word based on the 1-9 math so it makes intuitive sense
+        String riskLevel;
+        if (score >= 7) {
+            riskLevel = "CRITICAL";
+        } else if (score >= 4) {
+            riskLevel = "SEVERE";
+        } else {
+            riskLevel = "ELEVATED";
+        }
+
         System.out.println("\n" + DIVIDER);
-        System.out.printf("  FLAG %d of %d  |  Risk Score: %d/%d  |  Severity: %s%n",
-                position, total, score, RiskScorer.MAX_SCORE, flag.getSeverity());
+        System.out.printf("  FLAG %d of %d  |  Overall Risk: %d/%d (%s)  |  Rule Severity: %s%n",
+                position, total, score, RiskScorer.MAX_SCORE, riskLevel, flag.getSeverity());
         System.out.println(DIVIDER);
         System.out.println("Rule:    " + flag.getRuleName());
         System.out.println("Context: " + flag.getRawContext());

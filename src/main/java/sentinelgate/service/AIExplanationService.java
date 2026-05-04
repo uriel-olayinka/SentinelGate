@@ -94,7 +94,7 @@ public class AIExplanationService {
         StringBuilder sb = new StringBuilder();
         sb.append("You are SentinelGate, a fraud analysis assistant for banking analysts. ");
         sb.append("A transaction has been flagged. Explain the risk clearly and professionally in 2-3 sentences. ");
-        sb.append("Then wait for follow-up questions.\n\n");
+        sb.append("STRICT RULE: Your response MUST be under 30 words. Then wait for follow-up questions.\n\n");
 
         sb.append("FLAG: ").append(flag.getRuleName()).append(" (").append(flag.getSeverity()).append(" severity)\n");
         sb.append("DETAILS: ").append(flag.getRawContext()).append("\n\n");
